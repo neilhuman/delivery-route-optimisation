@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Delivery Route Optimiser</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+    <div class="header">
+        <h1>🚚 Delivery Route Optimiser</h1>
+        <p>Enter your delivery problem and find the optimal routes</p>
+    </div>
+
+    <!-- FULL SCREEN MAP -->
+    <div id="map"></div>
+
+    <!-- LEFT PANEL -->
+    <div class="panel left-panel" id="left-panel">
+        <button class="toggle-btn left-toggle" onclick="togglePanel('left-panel', 'left-toggle')">❮</button>
+        <div class="panel-content">
+            <h2>Problem Setup</h2>
+
+            <div class="section">
+                <h3>Depot Location</h3>
+                <input type="text" id="depot_address" placeholder="Enter depot address">
+                <button class="btn-geocode" onclick="geocode('depot')">📍 Find</button>
+                <small id="depot_coords" class="coord-display"></small>
+                <input type="hidden" id="depot_lat">
+                <input type="hidden" id="depot_lng">
+            </div>
+
+            <div class="section">
+                <h3>Customers</h3>
+                <div id="customers_list"></div>
+                <button class="btn-add" onclick="addCustomer()">+ Add Customer</button>
+            </div>
+
+            <div class="section">
+                <h3>Vehicle Settings</h3>
+                <label>Number of Vehicles</label>
+                <input type="number" id="num_vehicles" value="2" min="1">
+                <label>Capacity per Vehicle (kg)</label>
+                <input type="number" id="vehicle_capacity" value="40" min="1">
+                <label>Fuel Cost (R per km)</label>
+                <input type="number" id="fuel_cost" value="2.50" step="0.01" min="0">
+            </div>
+
+            <button class="btn-solve" onclick="solve()">🔍 Solve</button>
+            <div id="error_msg" class="error"></div>
+        </div>
+    </div>
+
+    <!-- RIGHT PANEL -->
+    <div class="panel right-panel" id="right-panel">
+        <button class="toggle-btn right-toggle" onclick="togglePanel('right-panel', 'right-toggle')">❯</button>
+        <div class="panel-content">
+            <div id="results_table"><p class="placeholder">Results will appear here after solving.</p></div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        var map = L.map('map').setView([-33.93, 18.55], 11);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        var customerCount = 0;
+        var drawnLayers = [];
+
+        function togglePanel(panelId, btnId) {
+            const panel = document.getElementById(panelId);
+            const btn = document.querySelector('.' + btnId);
+            panel.classList.toggle('collapsed');
+            if (panelId === 'left-panel') {
+              btn.innerText = panel.classList.contains('collapsed') ? '❯' : '❮';
+            } else {
+              btn.innerText = panel.classList.contains('collapsed') ? '❮' : '❯';
+            }
+        }
+
+        function addCustomer() {
+            customerCount++;
+            const div = document.createElement('div');
+            div.className = 'customer-row';
+            div.id = `customer_${customerCount}`;
+            div.innerHTML = `
+                <span>Customer ${customerCount}</span>
+                <input type="text" placeholder="Address" class="cust-address">
+                <button class="btn-geocode-small" onclick="geocodeCustomer(${customerCount})">📍 Find</button>
+                <small class="coord-display" id="coords_${customerCount}"></small>
+                <input type="hidden" class="cust-lat">
+                <input type="hidden" class="cust-lng">
+                <input type="number" placeholder="Demand (kg)" class="cust-demand">
+                <button class="btn-remove" onclick="removeCustomer(${customerCount})">✕</button>
+            `;
+            document.getElementById('customers_list').appendChild(div);
+        }
+
+        function removeCustomer(id) {
+            const el = document.getElementById(`customer_${id}`);
+            if (el) el.remove();
+        }
+
+        function clearMap() {
+            drawnLayers.forEach(l => map.removeLayer(l));
+            drawnLayers = [];
+        }
+
+        function solve() {
+            const depot_lat = document.getElementById('depot_lat').value;
+            const depot_lng = document.getElementById('depot_lng').value;
+            const num_vehicles = document.getElementById('num_vehicles').value;
+            const vehicle_capacity = document.getElementById('vehicle_capacity').value;
+            const fuel_cost = document.getElementById('fuel_cost').value;
+
+            const customers = [];
+            document.querySelectorAll('.customer-row').forEach(row => {
+                const lat = row.querySelector('.cust-lat').value;
+                const lng = row.querySelector('.cust-lng').value;
+                const demand = row.querySelector('.cust-demand').value;
+                if (lat && lng && demand) {
+                    customers.push({ lat, lng, demand });
+                }
+            });
+
+            if (customers.length === 0) {
+                document.getElementById('error_msg').innerText = 'Please add at least one customer.';
+                return;
+            }
+
+            document.getElementById('error_msg').innerText = '';
+            document.querySelector('.btn-solve').innerText = '⏳ Solving...';
+
+            fetch('/solve', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ depot_lat, depot_lng, num_vehicles, vehicle_capacity, fuel_cost, customers })
+            })
+            .then(res => res.json())
+            .then(data => {
+                document.querySelector('.btn-solve').innerText = '🔍 Solve';
+                if (data.error) {
+                    document.getElementById('error_msg').innerText = data.error;
+                    return;
+                }
+                clearMap();
+                drawRoutes(data.routes, data.markers);
+                drawTable(data.routes, vehicle_capacity, fuel_cost);
+
+                // Auto open right panel when results are ready
+                const rightPanel = document.getElementById('right-panel');
+                if (rightPanel.classList.contains('collapsed')) {
+                    togglePanel('right-panel', 'right-toggle');
+                }
+            });
+        }
+
+        function drawRoutes(routes, markers) {
+            markers.forEach(m => {
+                const color = m.name === 'Depot' ? 'green' : 'blue';
+                const marker = L.circleMarker([m.lat, m.lng], {
+                    radius: 8,
+                    fillColor: color,
+                    color: '#fff',
+                    fillOpacity: 0.9
+                }).addTo(map).bindPopup(`<b>${m.name}</b>${m.demand ? '<br>Demand: ' + m.demand + ' kg' : ''}`);
+                drawnLayers.push(marker);
+            });
+
+            routes.forEach(r => {
+                r.segments.forEach(segment => {
+                    const line = L.polyline(segment, {
+                        color: r.color,
+                        weight: 4,
+                        opacity: 0.8
+                    }).addTo(map);
+                    drawnLayers.push(line);
+                });
+            });
+        }
+
+        function drawTable(routes, capacity, fuelCost) {
+            let html = '<h2>Results Summary</h2><table><thead><tr><th>Vehicle</th><th>Route</th><th>Distance (km)</th><th>Load (kg)</th><th>Cost (R)</th></tr></thead><tbody>';
+            let totalDist = 0, totalCost = 0;
+            routes.forEach(r => {
+                totalDist += r.distance;
+                totalCost += r.cost;
+                html += `<tr>
+                    <td>Vehicle ${r.vehicle}</td>
+                    <td>${r.route.join(' → ')}</td>
+                    <td>${r.distance}</td>
+                    <td>${r.load} / ${capacity} kg</td>
+                    <td>R ${r.cost}</td>
+                </tr>`;
+            });
+            html += `</tbody><tfoot><tr><td colspan="2"><b>Total</b></td><td><b>${totalDist.toFixed(2)}</b></td><td></td><td><b>R ${totalCost.toFixed(2)}</b></td></tr></tfoot></table>`;
+            document.getElementById('results_table').innerHTML = html;
+        }
+
+        addCustomer();
+        addCustomer();
+
+        async function geocode(type) {
+            let address, coordDisplay, latInput, lngInput;
+
+            if (type === 'depot') {
+                address = document.getElementById('depot_address').value;
+                coordDisplay = document.getElementById('depot_coords');
+                latInput = document.getElementById('depot_lat');
+                lngInput = document.getElementById('depot_lng');
+            }
+
+            if (!address) return;
+
+            coordDisplay.innerText = 'Searching...';
+
+            const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1`;
+            const res = await fetch(url, { headers: { 'Accept-Language': 'en' } });
+            const data = await res.json();
+
+            if (data.length === 0) {
+                coordDisplay.innerText = 'Address not found. Try being more specific.';
+                return;
+            }
+
+            latInput.value = data[0].lat;
+            lngInput.value = data[0].lon;
+            coordDisplay.innerText = `✓ ${data[0].display_name.split(',').slice(0,3).join(',')}`;
+        }
+
+        async function geocodeCustomer(id) {
+            const row = document.getElementById(`customer_${id}`);
+            const address = row.querySelector('.cust-address').value;
+            const coordDisplay = document.getElementById(`coords_${id}`);
+            const latInput = row.querySelector('.cust-lat');
+            const lngInput = row.querySelector('.cust-lng');
+
+            if (!address) return;
+
+            coordDisplay.innerText = 'Searching...';
+
+            const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1`;
+            const res = await fetch(url, { headers: { 'Accept-Language': 'en' } });
+            const data = await res.json();
+
+            if (data.length === 0) {
+                coordDisplay.innerText = 'Address not found. Try being more specific.';
+                return;
+            }
+
+            latInput.value = data[0].lat;
+            lngInput.value = data[0].lon;
+            coordDisplay.innerText = `✓ ${data[0].display_name.split(',').slice(0,3).join(',')}`;
+        }
+    </script>
+</body>
+</html>
